@@ -1,0 +1,326 @@
+#!/bin/bash
+# created by: Richard Ostrochovský (RicO)
+
+function echo_usage {
+
+	readonly optional_error_message=$1
+
+	if [ ! -z "$optional_error_message" ] ; then
+		echo  ; >&2 echo "ERROR: $optional_error_message" ; echo
+	fi
+
+	echo "This utility copies files via scp through multiple nodes. Maximal setup: " ; echo
+	echo "[source_end] -> [source_hop] -> [local_host] -> [target_hop] -> [target_end]" ; echo
+
+	readonly synopsis_args_level_high="source_end[%source_hop] [sleep_seconds] [target_hop%]target_end"
+	read -r -d '' synopsis_args_level_low <<-'EOT'
+	[[hsudoer1/]user1@]addr1:path1[%[[lsudoer1/]huser1@]haddr1[:hpath1]] [NN] [[[[lsudoer2/]huser2@]haddr2[:hpath2]%][[hsudoer2/]user2]@addr2[:path2]]
+	EOT
+
+	echo "Usage:" ; echo
+	echo "# high-level" ; echo "$exe_name $synopsis_args_level_high" ; echo
+	echo "# low-level" ; echo "$exe_name $synopsis_args_level_low" ; echo
+
+	echo "NOTE 00: only first argument (source chain) is mandatory"
+	echo "         (subsequent arguments default to 0 (sleep seconds) and localhost CWD (target chain))" ; echo
+	echo "NOTE 01: more than *one* (optional) hop on each side is/are not supported in this version" ; echo
+	echo "NOTE 02: source end path is required" ; echo
+	echo "NOTE 03: if not specified, target end path defaults to default when using scp without value behind ':' in the target"
+	echo "         (usually home directory of target end connecting user ; if used without ':', CWD on localhost is used as target)" ; echo
+	echo "NOTE 04: intermediary hops (including localhost) paths default to $default_hops_target_folder, if not specified on command-line otherwise"
+	echo "         (for localhost this cannot be specified on command line in this version, may change in future, e.g. to CWD)" ; echo
+	echo "NOTE 05: wildcards in file path (e.g. *) not supported in this version" ; echo
+	echo "NOTE 06: sleep seconds (natural number NN) are useful e.g. in case of switching between VPN connections between transfers on each side" ; echo
+	echo "NOTE 07: authentication between localhost and hop is normally independent of authentication between hop and end" ; echo
+	echo "NOTE 08: tested with passwords required on localhost, but not tested with passwords required on hops" ; echo
+	echo "NOTE 09: clean up of temporary files on hops and localhost temporarily disabled (risky feature, needs more testing and control)" ; echo
+	echo "NOTE 10: TCP port, that SSH is listening to, is not configurable (via command-line) in this version (22 assumed by default)" ; echo
+	echo "NOTE 11: experimental unfinished non-functional netcat(nc) version of this utility may be enabled by execution of renamed/symlinked executable"
+	echo "         (containing 'nc' or 'netcat' after renaming or symlinking)" ; echo
+}
+
+# BASIC COMMAND-LINE PARSING
+
+readonly exe_name=`basename $0` ; readonly nc_netcat_present_regexp='(nc|netcat)'
+
+if [[ $exe_name =~ $nc_netcat_present_regexp ]] ; then
+
+	readonly nc_netcat_version=true
+
+	>&2 echo\
+	"WARN: Using $exe_name with netcat (nc) is experimental and not fully functional. Use it only if you intend to finish development of this feature."
+	# inspired by:
+	# https://serverfault.com/questions/37629/how-do-i-do-multihop-scp-transfers
+	# https://superuser.com/questions/276533/scp-files-via-intermediate-host
+	# possible (dis)advantage of netcat(nc) experimental behaviour (maybe eliminable):
+	# using end-to-end (local-to-end) authentication, instead of separate local-to-hop and hop-to-end authentications (default non-netcat(nc) behaviour)
+	# possible advantage: clean up on hop(s) not needed, as no intermediary copies are created on hop(s)
+	# current implementation uses ProxyCommand, but there are also other options: ProxyJump (scp -J), pipes, tunnels
+	# (but some of them also require port fowarding enabled on the hop(s))
+else
+	readonly nc_netcat_version=false
+fi
+
+readonly source_chain=$1 ; readonly default_hops_target_folder='/tmp' ; readonly natural_number_regexp='^[0-9]+$' ; readonly slash_present_regexp='^.*/.*$'
+
+
+if [[ $2 =~ $natural_number_regexp ]] ; then
+	readonly target_chain=$3 ; readonly sleep_seconds=$2
+else
+	readonly target_chain=$2 ; readonly sleep_seconds=0
+fi
+
+# CHAINS PRESENCE CHECKS
+
+if [ -z "$source_chain" ] ; then
+	echo_usage "No source chain defined." ; exit
+fi
+
+readonly IFS_original="$IFS" ; IFS='%'
+read -a source_chain_array <<< "$source_chain" ; readonly source_end=${source_chain_array[0]} ; readonly source_hop=${source_chain_array[1]}
+read -a target_chain_array <<< "$target_chain" ; target_end=${target_chain_array[1]} ; target_hop=${target_chain_array[0]}
+IFS="$IFS_original"
+
+# SOURCE END and TARGET END CHECKS
+
+if [ -z "$source_end" ] ; then
+	echo_usage "No source end defined." ; exit
+fi
+
+if [ -z "$target_end" ] ; then
+	if [ -z "$target_hop" ] ; then
+		echo "INFO: No target end defined. CWD "`pwd`"will be used as final destination."
+	else
+		target_end=$target_hop ; target_hop=""
+	fi
+fi
+
+# LOCATORS FROM USERS SEPARATION
+
+IFS='@'
+read -a source_end_array <<< "$source_end"
+read -a source_hop_array <<< "$source_hop"
+read -a target_hop_array <<< "$target_hop"
+read -a target_end_array <<< "$target_end"
+IFS="$IFS_original"
+
+if [ -z "${source_end_array[1]}" ] ; then
+	readonly source_end_locat="${source_end_array[0]}" ; readonly source_end_users=""
+else
+	readonly source_end_locat="${source_end_array[1]}" ; readonly source_end_users="${source_end_array[0]}"
+fi
+
+if [ -z "${source_hop_array[1]}" ] ; then
+	readonly source_hop_locat="${source_hop_array[0]}" ; readonly source_hop_users=""
+else
+	readonly source_hop_locat="${source_hop_array[1]}" ; readonly source_hop_users="${source_hop_array[0]}"
+fi
+
+if [ -z "${target_hop_array[1]}" ] ; then
+	readonly target_hop_locat="${target_hop_array[0]}" ; readonly target_hop_users=""
+else
+	readonly target_hop_locat="${target_hop_array[1]}" ; readonly target_hop_users="${target_hop_array[0]}"
+fi
+
+if [ -z "${target_end_array[1]}" ] ; then
+	readonly target_end_locat="${target_end_array[0]}" ; readonly target_end_users=""
+else
+	readonly target_end_locat="${target_end_array[1]}" ; readonly target_end_users="${target_end_array[0]}"
+fi
+
+# LOCATORS PRESENCE CHECKS
+
+if [ -z "$source_end_locat" ] ; then
+	echo_usage "No source end locator defined." ; exit
+fi
+
+#if [ -z "$target_end_locat" ] ; then # defaulted to CWD on localhost, no more needed to check
+#	echo_usage "No target end locator defined." ; exit
+#fi
+
+# PATHS FROM ADDRESSES SEPARATION
+
+IFS=':'
+read -a source_end_locat_array <<< "$source_end_locat" ; source_end_addr="${source_end_locat_array[0]}" ; source_end_path="${source_end_locat_array[1]}"
+read -a source_hop_locat_array <<< "$source_hop_locat" ; source_hop_addr="${source_hop_locat_array[0]}" ; source_hop_path="${source_hop_locat_array[1]}"
+read -a target_hop_locat_array <<< "$target_hop_locat" ; target_hop_addr="${target_hop_locat_array[0]}" ; target_hop_path="${target_hop_locat_array[1]}"
+read -a target_end_locat_array <<< "$target_end_locat" ; target_end_addr="${target_end_locat_array[0]}" ; target_end_path="${target_end_locat_array[1]}"
+IFS="$IFS_original"
+
+# PATHS CHECK AND DEFAULTING
+
+if [ -z "$source_end_path" ] ; then
+	echo_usage "No source end path defined." ; exit
+else
+	readonly copied_set_base=`basename $source_end_path`
+fi
+
+if [ -z "$source_hop_path" ] ; then
+	source_hop_path=$default_hops_target_folder
+fi
+
+if [ -z "$target_hop_path" ] ; then
+	target_hop_path=$default_hops_target_folder
+fi
+
+#if [ -z "$target_end_path" ] ; then			# check disabled by design, not needed, letting SCP to use its default
+#	target_end_path=$default_hops_target_folder	# early development version used the same defaults as intermediary hops (if not specified)
+#fi
+
+# SSH USERS FROM SUDOERS SEPARATION
+
+IFS='/'
+read -a source_end_users_array <<< "$source_end_users"
+read -a source_hop_users_array <<< "$source_hop_users"
+read -a target_hop_users_array <<< "$target_hop_users"
+read -a target_end_users_array <<< "$target_end_users"
+IFS="$IFS_original"
+
+if [[ $source_end_users =~ $slash_present_regexp ]] ; then
+	source_end_user="${source_end_users_array[1]}" ; readonly source_hop_nosudo=false ; source_hop_sudoer="${source_end_users_array[0]}"
+else
+	source_end_user="${source_end_users_array[0]}" ; readonly source_hop_nosudo=true ; source_hop_sudoer=""
+fi
+
+if [[ $source_hop_users =~ $slash_present_regexp ]] ; then
+	source_hop_user="${source_hop_users_array[1]}" ; readonly source_loc_nosudo=false ; source_loc_sudoer="${source_hop_users_array[0]}"
+else
+	source_hop_user="${source_hop_users_array[0]}" ; readonly source_loc_nosudo=true ; source_loc_sudoer=""
+fi
+
+if [[ $target_hop_users =~ $slash_present_regexp ]] ; then
+	target_hop_user="${target_hop_users_array[1]}" ; readonly target_loc_nosudo=false ; target_loc_sudoer="${target_hop_users_array[0]}"
+else
+	target_hop_user="${target_hop_users_array[0]}" ; readonly target_loc_nosudo=true ; target_loc_sudoer=""
+fi
+
+if [[ $target_end_users =~ $slash_present_regexp ]] ; then
+	target_end_user="${source_end_users_array[1]}" ; readonly target_hop_nosudo=false ; target_hop_sudoer="${target_end_users_array[0]}"
+else
+	target_end_user="${target_end_users_array[0]}" ; readonly target_hop_nosudo=true ; target_hop_sudoer=""
+fi
+
+# SET IMPLICIT USERS (CHAINS)
+
+if [ -z "$source_loc_sudoer" ] ; then
+	source_loc_sudoer=`whoami`
+fi
+
+if [ -z "$source_hop_user" ] ; then
+	source_hop_user="$source_loc_sudoer"
+fi
+
+if [ -z "$source_hop_sudoer" ] ; then
+	source_hop_sudoer="$source_hop_user"
+fi
+
+if [ -z "$source_end_user" ] ; then
+	source_end_user="$source_hop_sudoer"
+fi
+
+if [ -z "$target_loc_sudoer" ] ; then
+	target_loc_sudoer=`whoami`
+fi
+
+if [ -z "$target_hop_user" ] ; then
+	target_hop_user="$target_loc_sudoer"
+fi
+
+if [ -z "$target_hop_sudoer" ] ; then
+	target_hop_sudoer="$target_hop_user"
+fi
+
+if [ -z "$target_end_user" ] ; then
+	target_end_user="$target_hop_sudoer"
+fi
+
+# SUDO CALLS SETUP
+
+if [ "$source_loc_nosudo" = false ] ; then
+	readonly source_loc_sudo="sudo -u $source_loc_sudoer "
+fi
+
+if [ "$source_hop_nosudo" = false ] ; then
+	readonly source_hop_sudo="sudo -u $source_hop_sudoer "
+fi
+
+if [ "$target_loc_nosudo" = false ] ; then
+	readonly target_loc_sudo="sudo -u $target_loc_sudoer "
+fi
+
+if [ "$target_hop_nosudo" = false ] ; then
+	readonly target_hop_sudo="sudo -u $target_hop_sudoer "
+fi
+
+# SCP EXECUTION
+
+if [ -z "$source_hop_locat" ] ; then
+	readonly source_end_sudoer_location=local ; readonly source_rep=$source_end
+	readonly source_rep_addr=$source_end_addr ; readonly source_rep_path=$source_end_path
+	readonly source_rep_user=$source_end_user ; readonly source_rep_sudoer=$source_loc_sudoer ; readonly source_rep_sudo=$source_loc_sudo
+	echo "INFO: Source hop locator won't be used."
+else
+	readonly source_end_sudoer_location=hopal ; readonly source_rep=$source_hop
+	readonly source_rep_addr=$source_hop_addr ; readonly source_rep_path=$source_hop_path
+	readonly source_rep_user=$source_hop_user ; readonly source_rep_sudoer=$source_hop_sudoer ; readonly source_rep_sudo=$source_hop_sudo
+	echo "INFO: Source hop locator $source_hop_addr:$source_hop_path will be used by local/hopal user $source_loc_sudoer/$source_hop_user."
+
+	if [ "$nc_netcat_version" = true ] ; then
+		source_hop_ssh="-o ProxyCommand=\"${source_loc_sudo}ssh $source_hop_user@$source_hop_addr nc $source_end_user@$source_end_addr 22\" "
+	else
+		source_hop_scp="${source_hop_sudo}scp -r $source_end_user@$source_end_addr:$source_end_path $source_hop_path"
+#		source_hop_rm="sh -c \"sleep 30 ; ${source_hop_sudo}rm -rf $source_hop_path/$copied_set_base\" &" # prepare source hopal scheduled clean up
+		source_hop_ssh="${source_loc_sudo}ssh $source_hop_user@$source_hop_addr $source_hop_scp ; $source_hop_rm"
+	fi
+fi
+
+echo "INFO: Source end locator $source_end_addr:$source_end_path will be used by $source_end_sudoer_location/endal user $source_rep_sudoer/$source_end_user."
+
+if [ "$nc_netcat_version" = true ] ; then
+	echo "EXEC: ${source_loc_sudo}scp -r ${source_hop_ssh}$source_end_user@$source_end_addr:$source_end_path/$copied_set_base $default_hops_target_folder"
+	>&2 echo "WARN: Experimental feature. Effective call not included in this version."
+else
+	echo "EXEC: $source_hop_ssh" ; $source_hop_ssh
+	source_rep_scp="${source_loc_sudo}scp -r $source_rep_user@$source_rep_addr:$source_rep_path/$copied_set_base $default_hops_target_folder"
+	echo "EXEC: $source_rep_scp" ; $source_rep_scp
+fi
+
+if [ -z "$target_chain" -o -z "$target_end_locat" ] ; then # if target chain not specified, move files to CWD and stop here
+	local_host_move="${source_loc_sudo}mv $default_hops_target_folder/$copied_set_base ."
+	echo "EXEC: $local_host_move" ; $local_host_move ; exit
+fi
+
+echo "INFO: Sleeping $sleep_seconds seconds (until "`date --date="$sleep_seconds seconds"`") ..." ; sleep $sleep_seconds
+
+if [ -z "$target_hop_locat" ] ; then
+	readonly target_end_sudoer_location=local ; readonly target_rep=$target_end
+	readonly target_rep_addr=$target_end_addr ; readonly target_rep_path=$target_end_path
+	readonly target_rep_user=$target_end_user ; readonly target_rep_sudoer=$target_loc_sudoer ; readonly target_rep_sudo=$target_loc_sudo
+	echo "INFO: Target hop locator won't be used."
+else
+	readonly target_end_sudoer_location=hopal ; readonly target_rep=$target_hop
+	readonly target_rep_addr=$target_hop_addr ; readonly target_rep_path=$target_hop_path
+	readonly target_rep_user=$target_hop_user ; readonly target_rep_sudoer=$target_hop_sudoer ; readonly target_rep_sudo=$target_hop_sudo
+	echo "INFO: Target hop locator $target_hop_addr:$target_hop_path will be used by local/hopal user $target_loc_sudoer/$target_hop_user."
+
+	if [ "$nc_netcat_version" = true ] ; then
+		target_hop_ssh="-o ProxyCommand=\"${target_loc_sudo}ssh $target_hop_user@$target_hop_addr nc $target_end_user@$target_end_addr 22\" "
+	else
+		target_hop_scp="${target_hop_sudo}scp -r $target_hop_path/$copied_set_base $target_end_user@$target_end_addr:$target_end_path"
+#		target_hop_rm="${target_hop_sudo}rm -rf $target_hop_path/$copied_set_base"	# prepare target hopal copy clean up
+		target_hop_ssh="${target_loc_sudo}ssh $target_hop_user@$target_hop_addr $target_hop_scp ; $target_hop_rm"
+	fi
+fi
+
+echo "INFO: Target end locator $target_end_addr:$target_end_path will be used by $target_end_sudoer_location/endal user $target_rep_sudoer/$target_end_user."
+
+if [ "$nc_netcat_version" = true ] ; then
+	echo "EXEC: ${target_loc_sudo}scp -r ${target_hop_ssh}$target_end_user@$target_end_addr:$target_end_path/$copied_set_base $default_hops_target_folder"
+	>&2 echo "WARN: Experimental feature. Effective call not included in this version."
+else
+	target_rep_scp="${target_loc_sudo}scp -r $default_hops_target_folder/$copied_set_base $target_rep_user@$target_rep_addr:$target_rep_path"
+	echo "EXEC: $target_rep_scp" ; $target_rep_scp
+#	echo "EXEC: ${source_rep_sudo}rm -rf $default_hops_target_folder/$copied_set_base"	# clean up local copy
+	echo "EXEC: $target_hop_ssh" ; $target_hop_ssh
+fi
+
